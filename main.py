@@ -1,8 +1,9 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 #imports request library for HTTP requests
 import requests
 #imports Pythons request logging module to log errors
 import logging
+from datetime import datetime
 
 # Set up logging to see error messages
 logging.basicConfig(level=logging.INFO)
@@ -74,3 +75,52 @@ def get_bitcoin_price():
     
     # Return the price data (which is already a dictionary)
     return price_data
+
+
+@app.get("/api/coins/bitcoin")
+def get_bitcoin():
+    """
+    Endpoint that returns Bitcoin's current price with formatted response.
+    This endpoint is designed for external clients (e.g., frontend).
+    """
+    # Call the existing fetch function to get Bitcoin price from CoinGecko
+    price_data = fetch_bitcoin_price()
+    
+    # If fetch_bitcoin_price() returned None, the API call failed
+    if price_data is None:
+        # Raise HTTPException with status code 502 (Bad Gateway)
+        # This indicates the server received an invalid response from upstream
+        # detail parameter provides the error message to the client
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to fetch Bitcoin price from CoinGecko API"
+        )
+    
+    # Extract the price from the CoinGecko response
+    # price_data structure: {"bitcoin": {"usd": 45000.50}}
+    bitcoin_data = price_data.get("bitcoin", {})
+    price_usd = bitcoin_data.get("usd")
+    
+    # If price is missing (shouldn't happen, but defensive programming)
+    if price_usd is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid data received from CoinGecko API"
+        )
+    
+    # Get current timestamp in ISO format
+    # datetime.now() gets current time, isoformat() converts to string like "2025-01-15T10:30:45"
+    timestamp = datetime.now().isoformat()
+    
+    # Build the response dictionary with all required fields
+    # FastAPI will automatically convert this Python dict to JSON
+    response = {
+        "name": "Bitcoin",
+        "price_usd": price_usd,
+        "timestamp": timestamp,
+        "note": "Live data from CoinGecko"
+    }
+    
+    # Return the response dictionary
+    # FastAPI automatically serializes Python dicts to JSON
+    return response
