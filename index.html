@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Dashboard - Bitcoin Price</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #333;
+        }
+        #price-container {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #f9f9f9;
+        }
+        .price {
+            font-size: 2em;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .loading {
+            color: #666;
+            font-style: italic;
+        }
+        .error {
+            color: #d32f2f;
+            font-weight: bold;
+        }
+        .timestamp {
+            color: #666;
+            font-size: 0.9em;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Crypto Market Dashboard</h1>
+    <div id="price-container">
+        <div id="content" class="loading">Loading Bitcoin price...</div>
+    </div>
+
+    <script>
+        // Backend API endpoint URL
+        // This points to the FastAPI server running on localhost:8000
+        const API_URL = 'http://localhost:8000/api/coins/bitcoin';
+        
+        // Get reference to the content div where we'll display the price
+        const contentDiv = document.getElementById('content');
+        
+        // Function to fetch and display Bitcoin price
+        async function fetchBitcoinPrice() {
+            try {
+                // fetch() is a modern JavaScript function for making HTTP requests
+                // It returns a Promise that resolves to a Response object
+                // await pauses execution until the Promise resolves
+                const response = await fetch(API_URL);
+                
+                // Check if the HTTP response status is OK (200-299)
+                // If not OK, the request failed (e.g., 502 error from backend)
+                if (!response.ok) {
+                    // response.json() parses the error response body as JSON
+                    // await waits for the JSON parsing to complete
+                    const errorData = await response.json();
+                    // Throw an error with the error message from the backend
+                    throw new Error(errorData.detail || 'Failed to fetch Bitcoin price');
+                }
+                
+                // If response is OK, parse the JSON body
+                // The backend returns: {"name": "Bitcoin", "price_usd": 45000.50, "timestamp": "...", "note": "..."}
+                // await waits for JSON parsing to complete
+                const data = await response.json();
+                
+                // Extract the price from the response object
+                // data.price_usd contains the numeric price value
+                const price = data.price_usd;
+                
+                // Format the price as currency (add $ and commas)
+                // toLocaleString() formats numbers with locale-specific formatting
+                // 'en-US' specifies US format, style: 'currency' adds $ symbol
+                const formattedPrice = price.toLocaleString('en-US', {
+                    style: 'currency',
+                    currency: 'USD',
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2
+                });
+                
+                // Format the timestamp for display
+                // new Date() converts the ISO timestamp string to a Date object
+                // toLocaleString() formats it in a readable way
+                const timestamp = new Date(data.timestamp).toLocaleString();
+                
+                // Update the content div with the price and timestamp
+                // innerHTML replaces the content of the div
+                contentDiv.className = ''; // Remove loading class
+                contentDiv.innerHTML = `
+                    <div class="price">${formattedPrice}</div>
+                    <div class="timestamp">Last updated: ${timestamp}</div>
+                `;
+                
+            } catch (error) {
+                // catch block handles any errors that occur in the try block
+                // This includes network errors, JSON parsing errors, or thrown errors
+                
+                // Update the content div to show the error message
+                contentDiv.className = 'error'; // Add error styling
+                contentDiv.innerHTML = `Error: ${error.message}`;
+            }
+        }
+        
+        // Call fetchBitcoinPrice() when the page loads
+        // window.addEventListener waits for the 'load' event (page fully loaded)
+        // Then it executes the fetchBitcoinPrice function
+        window.addEventListener('load', fetchBitcoinPrice);
+    </script>
+</body>
+</html>
