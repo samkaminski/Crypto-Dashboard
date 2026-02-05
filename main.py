@@ -101,6 +101,42 @@ def fetch_multiple_coins():
         return None
 
 
+def fetch_global_metrics():
+    """
+    Fetches global cryptocurrency market metrics from CoinGecko API.
+    
+    Returns:
+        dict: Global market data dictionary, or None if error occurs
+    """
+    # CoinGecko API endpoint for global market data
+    # /global returns aggregate market statistics for all cryptocurrencies
+    url = "https://api.coingecko.com/api/v3/global"
+    
+    try:
+        # Make HTTP GET request to CoinGecko API
+        # timeout=10 means the request will fail after 10 seconds if no response
+        response = requests.get(url, timeout=10)
+        
+        # Check if the HTTP response status code is 200 (success)
+        # If not 200, something went wrong with the API request
+        if response.status_code != 200:
+            logger.error(f"CoinGecko API returned status code {response.status_code}")
+            return None
+        
+        # Parse the JSON response into a Python dictionary
+        # CoinGecko returns: {"data": {"total_market_cap": {...}, "total_volume": {...}, ...}}
+        data = response.json()
+        
+        # Return the data dictionary
+        return data
+        
+    except requests.exceptions.RequestException as e:
+        # This catches network errors, timeouts, connection issues, etc.
+        # requests.exceptions.RequestException is the base class for all request errors
+        logger.error(f"Error fetching global metrics: {e}")
+        return None
+
+
 @app.get("/bitcoin-price")
 def get_bitcoin_price():
     """
@@ -214,3 +250,59 @@ def get_coins():
     # Return the list of transformed coins
     # FastAPI automatically serializes Python lists to JSON arrays
     return transformed_coins
+
+
+@app.get("/api/global")
+def get_global_metrics():
+    """
+    Endpoint that returns global cryptocurrency market metrics.
+    Returns total market cap, total 24h volume, and BTC dominance.
+    """
+    # Call the function to fetch global metrics from CoinGecko
+    global_data = fetch_global_metrics()
+    
+    # If fetch_global_metrics() returned None, the API call failed
+    if global_data is None:
+        # Raise HTTPException with status code 502 (Bad Gateway)
+        # This indicates the server received an invalid response from upstream
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to fetch global metrics from CoinGecko API"
+        )
+    
+    # Extract the nested data object from CoinGecko's response
+    # CoinGecko wraps everything in a "data" key
+    data = global_data.get("data", {})
+    
+    # Extract total market cap in USD
+    # Structure: data.total_market_cap.usd
+    total_market_cap = data.get("total_market_cap", {})
+    total_market_cap_usd = total_market_cap.get("usd")
+    
+    # Extract total 24h volume in USD
+    # Structure: data.total_volume.usd
+    total_volume = data.get("total_volume", {})
+    total_volume_24h_usd = total_volume.get("usd")
+    
+    # Extract BTC dominance percentage
+    # Structure: data.market_cap_percentage.btc
+    market_cap_percentage = data.get("market_cap_percentage", {})
+    btc_dominance_percent = market_cap_percentage.get("btc")
+    
+    # Check if any required fields are missing
+    if total_market_cap_usd is None or total_volume_24h_usd is None or btc_dominance_percent is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid data received from CoinGecko API"
+        )
+    
+    # Build a clean response object with standardized field names
+    response = {
+        "total_market_cap_usd": total_market_cap_usd,
+        "total_volume_24h_usd": total_volume_24h_usd,
+        "btc_dominance_percent": btc_dominance_percent
+    }
+    
+    # Return the response dictionary
+    # FastAPI automatically serializes Python dicts to JSON
+    return response
