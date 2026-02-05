@@ -61,6 +61,46 @@ def fetch_bitcoin_price():
         return None
 
 
+def fetch_multiple_coins():
+    """
+    Fetches market data for multiple cryptocurrencies from CoinGecko API.
+    
+    Returns:
+        list: List of coin data dictionaries, or None if error occurs
+    """
+    # CoinGecko API endpoint for market data
+    # /coins/markets returns market data for multiple coins in one call
+    # vs_currency=usd means all prices are in US Dollars
+    # ids=bitcoin,ethereum,solana,cardano,ripple specifies which coins to fetch
+    # order=market_cap_desc orders by market cap (descending)
+    # per_page=5 limits results to 5 coins
+    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=bitcoin,ethereum,solana,cardano,ripple&order=market_cap_desc&per_page=5"
+    
+    try:
+        # Make HTTP GET request to CoinGecko API
+        # timeout=10 means the request will fail after 10 seconds if no response
+        response = requests.get(url, timeout=10)
+        
+        # Check if the HTTP response status code is 200 (success)
+        # If not 200, something went wrong with the API request
+        if response.status_code != 200:
+            logger.error(f"CoinGecko API returned status code {response.status_code}")
+            return None
+        
+        # Parse the JSON response into a Python list
+        # CoinGecko returns an array of coin objects
+        data = response.json()
+        
+        # Return the data list
+        return data
+        
+    except requests.exceptions.RequestException as e:
+        # This catches network errors, timeouts, connection issues, etc.
+        # requests.exceptions.RequestException is the base class for all request errors
+        logger.error(f"Error fetching multiple coins: {e}")
+        return None
+
+
 @app.get("/bitcoin-price")
 def get_bitcoin_price():
     """
@@ -124,3 +164,53 @@ def get_bitcoin():
     # Return the response dictionary
     # FastAPI automatically serializes Python dicts to JSON
     return response
+
+
+@app.get("/api/coins")
+def get_coins():
+    """
+    Endpoint that returns market data for multiple cryptocurrencies.
+    Returns a list of top 5 coins with price, 24h change, and volume.
+    """
+    # Call the function to fetch multiple coins from CoinGecko
+    coins_data = fetch_multiple_coins()
+    
+    # If fetch_multiple_coins() returned None, the API call failed
+    if coins_data is None:
+        # Raise HTTPException with status code 502 (Bad Gateway)
+        # This indicates the server received an invalid response from upstream
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to fetch coin data from CoinGecko API"
+        )
+    
+    # Transform the CoinGecko response into our clean format
+    # CoinGecko returns an array, so we iterate through each coin
+    transformed_coins = []
+    
+    for coin in coins_data:
+        # Extract and transform each field from CoinGecko's format to our format
+        # CoinGecko uses different field names, so we map them
+        
+        # coin.get() safely retrieves values, with None as default if missing
+        coin_id = coin.get("id")  # e.g., "bitcoin"
+        coin_name = coin.get("name")  # e.g., "Bitcoin"
+        price_usd = coin.get("current_price")  # e.g., 45000.50
+        change_24h = coin.get("price_change_percentage_24h")  # e.g., 2.5 (percentage)
+        volume_24h_usd = coin.get("total_volume")  # e.g., 25000000000 (in USD)
+        
+        # Build a clean coin object with our standardized field names
+        transformed_coin = {
+            "id": coin_id,
+            "name": coin_name,
+            "price_usd": price_usd,
+            "change_24h": change_24h,
+            "volume_24h_usd": volume_24h_usd
+        }
+        
+        # Add this coin to our result list
+        transformed_coins.append(transformed_coin)
+    
+    # Return the list of transformed coins
+    # FastAPI automatically serializes Python lists to JSON arrays
+    return transformed_coins
