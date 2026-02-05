@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crypto Dashboard - Bitcoin Price</title>
+    <title>Crypto Dashboard</title>
     <style>
         body {
             font-family: Arial, sans-serif;
-            max-width: 600px;
+            max-width: 900px;
             margin: 50px auto;
             padding: 20px;
             line-height: 1.6;
@@ -15,49 +15,100 @@
         h1 {
             color: #333;
         }
-        #price-container {
+        #table-container {
             margin: 20px 0;
-            padding: 20px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            background-color: #f9f9f9;
         }
-        .price {
-            font-size: 2em;
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th {
+            background-color: #f4f4f4;
+            padding: 12px;
+            text-align: left;
+            border-bottom: 2px solid #ddd;
             font-weight: bold;
-            color: #2c3e50;
+        }
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #ddd;
+        }
+        tr:hover {
+            background-color: #f9f9f9;
         }
         .loading {
             color: #666;
             font-style: italic;
+            padding: 20px;
         }
         .error {
             color: #d32f2f;
             font-weight: bold;
+            padding: 20px;
         }
-        .timestamp {
-            color: #666;
-            font-size: 0.9em;
-            margin-top: 10px;
+        .positive {
+            color: #2e7d32;
+            font-weight: bold;
+        }
+        .negative {
+            color: #c62828;
+            font-weight: bold;
+        }
+        .coin-name {
+            font-weight: bold;
         }
     </style>
 </head>
 <body>
     <h1>Crypto Market Dashboard</h1>
-    <div id="price-container">
-        <div id="content" class="loading">Loading Bitcoin price...</div>
+    <div id="table-container">
+        <div id="content" class="loading">Loading coin data...</div>
     </div>
 
     <script>
         // Backend API endpoint URL
         // This points to the FastAPI server running on localhost:8000
-        const API_URL = 'http://localhost:8000/api/coins/bitcoin';
+        // The /api/coins endpoint returns an array of coin objects
+        const API_URL = 'http://localhost:8000/api/coins';
         
-        // Get reference to the content div where we'll display the price
+        // Get reference to the content div where we'll display the table
         const contentDiv = document.getElementById('content');
         
-        // Function to fetch and display Bitcoin price
-        async function fetchBitcoinPrice() {
+        // Function to format a number as currency (USD)
+        // Takes a number and returns a formatted string like "$45,000.50"
+        function formatCurrency(value) {
+            // toLocaleString() formats numbers with locale-specific formatting
+            // 'en-US' specifies US format, style: 'currency' adds $ symbol
+            return value.toLocaleString('en-US', {
+                style: 'currency',
+                currency: 'USD',
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            });
+        }
+        
+        // Function to format a percentage value
+        // Takes a number and returns a formatted string like "2.50%"
+        function formatPercent(value) {
+            // toFixed(2) rounds to 2 decimal places
+            // Add the % symbol at the end
+            return value.toFixed(2) + '%';
+        }
+        
+        // Function to format a large number (for volume)
+        // Takes a number and returns a formatted string like "$25,000,000,000"
+        function formatVolume(value) {
+            // Use toLocaleString() to add commas for readability
+            // Then add $ symbol manually since we're not using currency style
+            return '$' + value.toLocaleString('en-US', {
+                minimumFractionDigits: 0,
+                maximumFractionDigits: 0
+            });
+        }
+        
+        // Function to fetch and display multiple coins
+        async function fetchCoins() {
             try {
                 // fetch() is a modern JavaScript function for making HTTP requests
                 // It returns a Promise that resolves to a Response object
@@ -71,40 +122,68 @@
                     // await waits for the JSON parsing to complete
                     const errorData = await response.json();
                     // Throw an error with the error message from the backend
-                    throw new Error(errorData.detail || 'Failed to fetch Bitcoin price');
+                    throw new Error(errorData.detail || 'Failed to fetch coin data');
                 }
                 
                 // If response is OK, parse the JSON body
-                // The backend returns: {"name": "Bitcoin", "price_usd": 45000.50, "timestamp": "...", "note": "..."}
+                // The backend returns an array: [{id: "bitcoin", name: "Bitcoin", price_usd: 45000.50, ...}, ...]
                 // await waits for JSON parsing to complete
-                const data = await response.json();
+                const coins = await response.json();
                 
-                // Extract the price from the response object
-                // data.price_usd contains the numeric price value
-                const price = data.price_usd;
+                // Check if coins is an array and has data
+                if (!Array.isArray(coins) || coins.length === 0) {
+                    throw new Error('No coin data received');
+                }
                 
-                // Format the price as currency (add $ and commas)
-                // toLocaleString() formats numbers with locale-specific formatting
-                // 'en-US' specifies US format, style: 'currency' adds $ symbol
-                const formattedPrice = price.toLocaleString('en-US', {
-                    style: 'currency',
-                    currency: 'USD',
-                    minimumFractionDigits: 2,
-                    maximumFractionDigits: 2
+                // Build the HTML table structure
+                // Start with the table header row
+                let tableHTML = '<table><thead><tr>';
+                tableHTML += '<th>Coin Name</th>';
+                tableHTML += '<th>Price (USD)</th>';
+                tableHTML += '<th>24h Change (%)</th>';
+                tableHTML += '<th>24h Volume (USD)</th>';
+                tableHTML += '</tr></thead><tbody>';
+                
+                // Iterate through each coin in the array
+                // coins.forEach() loops through each coin object
+                coins.forEach(function(coin) {
+                    // Start a new table row for this coin
+                    tableHTML += '<tr>';
+                    
+                    // Coin Name column
+                    // coin.name contains the full name (e.g., "Bitcoin")
+                    tableHTML += `<td class="coin-name">${coin.name}</td>`;
+                    
+                    // Price column
+                    // coin.price_usd contains the numeric price
+                    // formatCurrency() formats it as "$45,000.50"
+                    tableHTML += `<td>${formatCurrency(coin.price_usd)}</td>`;
+                    
+                    // 24h Change column
+                    // coin.change_24h contains the percentage change (e.g., 2.5 or -1.2)
+                    const change24h = coin.change_24h;
+                    // Determine if the change is positive or negative
+                    const changeClass = change24h >= 0 ? 'positive' : 'negative';
+                    // Format the percentage and apply color class
+                    // If positive, class="positive" (green), if negative, class="negative" (red)
+                    tableHTML += `<td class="${changeClass}">${formatPercent(change24h)}</td>`;
+                    
+                    // 24h Volume column
+                    // coin.volume_24h_usd contains the volume in USD
+                    // formatVolume() formats it as "$25,000,000,000"
+                    tableHTML += `<td>${formatVolume(coin.volume_24h_usd)}</td>`;
+                    
+                    // Close the table row
+                    tableHTML += '</tr>';
                 });
                 
-                // Format the timestamp for display
-                // new Date() converts the ISO timestamp string to a Date object
-                // toLocaleString() formats it in a readable way
-                const timestamp = new Date(data.timestamp).toLocaleString();
+                // Close the table body and table tags
+                tableHTML += '</tbody></table>';
                 
-                // Update the content div with the price and timestamp
+                // Update the content div with the table HTML
                 // innerHTML replaces the content of the div
                 contentDiv.className = ''; // Remove loading class
-                contentDiv.innerHTML = `
-                    <div class="price">${formattedPrice}</div>
-                    <div class="timestamp">Last updated: ${timestamp}</div>
-                `;
+                contentDiv.innerHTML = tableHTML;
                 
             } catch (error) {
                 // catch block handles any errors that occur in the try block
@@ -116,10 +195,10 @@
             }
         }
         
-        // Call fetchBitcoinPrice() when the page loads
+        // Call fetchCoins() when the page loads
         // window.addEventListener waits for the 'load' event (page fully loaded)
-        // Then it executes the fetchBitcoinPrice function
-        window.addEventListener('load', fetchBitcoinPrice);
+        // Then it executes the fetchCoins function
+        window.addEventListener('load', fetchCoins);
     </script>
 </body>
 </html>
