@@ -15,6 +15,37 @@
         h1 {
             color: #333;
         }
+        #global-summary {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #f9f9f9;
+        }
+        #global-summary h2 {
+            margin-top: 0;
+            color: #333;
+            font-size: 1.2em;
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-top: 15px;
+        }
+        .summary-item {
+            text-align: left;
+        }
+        .summary-label {
+            font-size: 0.9em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .summary-value {
+            font-size: 1.3em;
+            font-weight: bold;
+            color: #2c3e50;
+        }
         #table-container {
             margin: 20px 0;
         }
@@ -62,18 +93,27 @@
 </head>
 <body>
     <h1>Crypto Market Dashboard</h1>
+    
+    <!-- Global Market Summary Header -->
+    <div id="global-summary">
+        <h2>Global Market Summary</h2>
+        <div id="global-content" class="loading">Loading global metrics...</div>
+    </div>
+    
+    <!-- Coin Table -->
     <div id="table-container">
         <div id="content" class="loading">Loading coin data...</div>
     </div>
 
     <script>
-        // Backend API endpoint URL
-        // This points to the FastAPI server running on localhost:8000
-        // The /api/coins endpoint returns an array of coin objects
-        const API_URL = 'http://localhost:8000/api/coins';
+        // Backend API endpoint URLs
+        // These point to the FastAPI server running on localhost:8000
+        const COINS_API_URL = 'http://localhost:8000/api/coins';
+        const GLOBAL_API_URL = 'http://localhost:8000/api/global';
         
-        // Get reference to the content div where we'll display the table
+        // Get references to the DOM elements
         const contentDiv = document.getElementById('content');
+        const globalContentDiv = document.getElementById('global-content');
         
         // Function to format a number as currency (USD)
         // Takes a number and returns a formatted string like "$45,000.50"
@@ -107,13 +147,96 @@
             });
         }
         
+        // Function to format large numbers with abbreviations (B for billions, T for trillions)
+        // Takes a number and returns a formatted string like "$1.2T" or "$950B"
+        function formatLargeNumber(value) {
+            // 1 trillion = 1,000,000,000,000
+            // If value is >= 1 trillion, divide by 1 trillion and add "T"
+            if (value >= 1000000000000) {
+                const trillions = value / 1000000000000;
+                // toFixed(1) rounds to 1 decimal place
+                return '$' + trillions.toFixed(1) + 'T';
+            }
+            // 1 billion = 1,000,000,000
+            // If value is >= 1 billion, divide by 1 billion and add "B"
+            else if (value >= 1000000000) {
+                const billions = value / 1000000000;
+                // toFixed(1) rounds to 1 decimal place
+                return '$' + billions.toFixed(1) + 'B';
+            }
+            // For values less than 1 billion, use regular formatting with commas
+            else {
+                return '$' + value.toLocaleString('en-US', {
+                    minimumFractionDigits: 0,
+                    maximumFractionDigits: 0
+                });
+            }
+        }
+        
+        // Function to fetch and display global market metrics
+        async function fetchGlobalMetrics() {
+            try {
+                // fetch() makes an HTTP GET request to the global metrics endpoint
+                // await pauses execution until the Promise resolves
+                const response = await fetch(GLOBAL_API_URL);
+                
+                // Check if the HTTP response status is OK (200-299)
+                if (!response.ok) {
+                    // Parse error response and throw an error
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || 'Failed to fetch global metrics');
+                }
+                
+                // Parse the JSON response
+                // The backend returns: {total_market_cap_usd: 2000000000000, total_volume_24h_usd: 80000000000, btc_dominance_percent: 45.5}
+                const globalData = await response.json();
+                
+                // Build the HTML for the global summary
+                // Create a grid layout with 3 items
+                let summaryHTML = '<div class="summary-grid">';
+                
+                // Total Market Cap item
+                summaryHTML += '<div class="summary-item">';
+                summaryHTML += '<div class="summary-label">Total Market Cap</div>';
+                // formatLargeNumber() formats the value with abbreviation (e.g., "$1.2T")
+                summaryHTML += `<div class="summary-value">${formatLargeNumber(globalData.total_market_cap_usd)}</div>`;
+                summaryHTML += '</div>';
+                
+                // Total 24h Volume item
+                summaryHTML += '<div class="summary-item">';
+                summaryHTML += '<div class="summary-label">Total 24h Volume</div>';
+                // formatLargeNumber() formats the value with abbreviation (e.g., "$950B")
+                summaryHTML += `<div class="summary-value">${formatLargeNumber(globalData.total_volume_24h_usd)}</div>`;
+                summaryHTML += '</div>';
+                
+                // Bitcoin Dominance item
+                summaryHTML += '<div class="summary-item">';
+                summaryHTML += '<div class="summary-label">Bitcoin Dominance</div>';
+                // formatPercent() formats the percentage (e.g., "48.3%")
+                summaryHTML += `<div class="summary-value">${formatPercent(globalData.btc_dominance_percent)}</div>`;
+                summaryHTML += '</div>';
+                
+                summaryHTML += '</div>';
+                
+                // Update the global content div with the summary HTML
+                globalContentDiv.className = ''; // Remove loading class
+                globalContentDiv.innerHTML = summaryHTML;
+                
+            } catch (error) {
+                // Handle errors independently - show error in global summary area
+                // This doesn't affect the coin table
+                globalContentDiv.className = 'error'; // Add error styling
+                globalContentDiv.innerHTML = `Error: ${error.message}`;
+            }
+        }
+        
         // Function to fetch and display multiple coins
         async function fetchCoins() {
             try {
                 // fetch() is a modern JavaScript function for making HTTP requests
                 // It returns a Promise that resolves to a Response object
                 // await pauses execution until the Promise resolves
-                const response = await fetch(API_URL);
+                const response = await fetch(COINS_API_URL);
                 
                 // Check if the HTTP response status is OK (200-299)
                 // If not OK, the request failed (e.g., 502 error from backend)
@@ -195,10 +318,13 @@
             }
         }
         
-        // Call fetchCoins() when the page loads
+        // Call both fetch functions when the page loads
+        // They run independently - if one fails, the other can still succeed
         // window.addEventListener waits for the 'load' event (page fully loaded)
-        // Then it executes the fetchCoins function
-        window.addEventListener('load', fetchCoins);
+        window.addEventListener('load', function() {
+            fetchGlobalMetrics(); // Fetch global metrics
+            fetchCoins(); // Fetch coin data
+        });
     </script>
 </body>
 </html>
