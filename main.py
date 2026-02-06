@@ -4,6 +4,7 @@ import requests
 #imports Pythons request logging module to log errors
 import logging
 from datetime import datetime
+import time
 
 # Set up logging to see error messages
 logging.basicConfig(level=logging.INFO)
@@ -12,6 +13,16 @@ logger = logging.getLogger(__name__)
 #create a FastAPI application instance
 #Main app object that handles routing and requests
 app = FastAPI()
+
+# In-memory cache for API responses
+# Structure: {"endpoint_name": {"data": response_data, "timestamp": unix_timestamp}}
+# Each cache entry stores the response data and when it was fetched
+cache = {}
+
+# Cache TTL (Time To Live) in seconds
+# 5 minutes = 300 seconds
+# Data older than this will be considered expired
+CACHE_TTL = 300
 
 #Register a GET route at / (root path)
 @app.get("/")
@@ -137,6 +148,72 @@ def fetch_global_metrics():
         return None
 
 
+def is_cache_valid(cache_key):
+    """
+    Checks if cached data for a given key is still valid (not expired).
+    
+    Args:
+        cache_key: String key identifying the cache entry (e.g., "coins", "global")
+    
+    Returns:
+        bool: True if cache exists and is valid, False otherwise
+    """
+    # Check if the cache key exists
+    if cache_key not in cache:
+        # Cache doesn't exist
+        return False
+    
+    # Get the cached entry
+    cache_entry = cache[cache_key]
+    
+    # Get the timestamp when data was cached
+    cached_timestamp = cache_entry.get("timestamp", 0)
+    
+    # Get current time as Unix timestamp (seconds since epoch)
+    current_time = time.time()
+    
+    # Calculate how old the cache is (in seconds)
+    cache_age = current_time - cached_timestamp
+    
+    # Check if cache is older than TTL
+    if cache_age >= CACHE_TTL:
+        # Cache has expired
+        return False
+    
+    # Cache exists and is still valid
+    return True
+
+
+def get_cached_data(cache_key):
+    """
+    Retrieves cached data for a given key.
+    
+    Args:
+        cache_key: String key identifying the cache entry
+    
+    Returns:
+        The cached data, or None if not found
+    """
+    if cache_key in cache:
+        return cache[cache_key].get("data")
+    return None
+
+
+def set_cached_data(cache_key, data):
+    """
+    Stores data in the cache with current timestamp.
+    
+    Args:
+        cache_key: String key identifying the cache entry
+        data: The data to cache
+    """
+    # Store data with current timestamp
+    cache[cache_key] = {
+        "data": data,
+        "timestamp": time.time()
+    }
+
+
 @app.get("/bitcoin-price")
 def get_bitcoin_price():
     """
@@ -207,7 +284,20 @@ def get_coins():
     """
     Endpoint that returns market data for multiple cryptocurrencies.
     Returns a list of top 5 coins with price, 24h change, and volume.
+    Uses in-memory cache to reduce CoinGecko API calls.
     """
+    cache_key = "coins"
+    
+    # Check if we have valid cached data
+    if is_cache_valid(cache_key):
+        # Cache hit - return cached data
+        cached_data = get_cached_data(cache_key)
+        logger.info(f"Cache HIT for {cache_key} - returning cached data")
+        return cached_data
+    
+    # Cache miss or expired - fetch fresh data from CoinGecko
+    logger.info(f"Cache MISS for {cache_key} - fetching from CoinGecko")
+    
     # Call the function to fetch multiple coins from CoinGecko
     coins_data = fetch_multiple_coins()
     
@@ -247,6 +337,10 @@ def get_coins():
         # Add this coin to our result list
         transformed_coins.append(transformed_coin)
     
+    # Store the transformed data in cache for future requests
+    set_cached_data(cache_key, transformed_coins)
+    logger.info(f"Cached data for {cache_key} with TTL of {CACHE_TTL} seconds")
+    
     # Return the list of transformed coins
     # FastAPI automatically serializes Python lists to JSON arrays
     return transformed_coins
@@ -257,7 +351,20 @@ def get_global_metrics():
     """
     Endpoint that returns global cryptocurrency market metrics.
     Returns total market cap, total 24h volume, and BTC dominance.
+    Uses in-memory cache to reduce CoinGecko API calls.
     """
+    cache_key = "global"
+    
+    # Check if we have valid cached data
+    if is_cache_valid(cache_key):
+        # Cache hit - return cached data
+        cached_data = get_cached_data(cache_key)
+        logger.info(f"Cache HIT for {cache_key} - returning cached data")
+        return cached_data
+    
+    # Cache miss or expired - fetch fresh data from CoinGecko
+    logger.info(f"Cache MISS for {cache_key} - fetching from CoinGecko")
+    
     # Call the function to fetch global metrics from CoinGecko
     global_data = fetch_global_metrics()
     
@@ -302,6 +409,10 @@ def get_global_metrics():
         "total_volume_24h_usd": total_volume_24h_usd,
         "btc_dominance_percent": btc_dominance_percent
     }
+    
+    # Store the response in cache for future requests
+    set_cached_data(cache_key, response)
+    logger.info(f"Cached data for {cache_key} with TTL of {CACHE_TTL} seconds")
     
     # Return the response dictionary
     # FastAPI automatically serializes Python dicts to JSON
