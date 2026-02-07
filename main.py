@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 #imports request library for HTTP requests
 import requests
 #imports Pythons request logging module to log errors
@@ -13,6 +14,22 @@ logger = logging.getLogger(__name__)
 #create a FastAPI application instance
 #Main app object that handles routing and requests
 app = FastAPI()
+
+# Configure CORS (Cross-Origin Resource Sharing) middleware
+# This allows the frontend (running on a different port) to make requests to the backend
+# Without this, browsers block requests between different origins (different ports = different origins)
+# Multiple origins: localhost (hostname), 127.0.0.1 (IPv4), [::] (IPv6 - e.g. python -m http.server 8080)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://[::]:8080",
+    ],
+    allow_credentials=True,  # Allow cookies/credentials to be sent
+    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Allow all headers
+)
 
 # In-memory cache for API responses
 # Structure: {"endpoint_name": {"data": response_data, "timestamp": unix_timestamp}}
