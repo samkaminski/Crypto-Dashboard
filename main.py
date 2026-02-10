@@ -1,5 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+# Standard library: SQLite for persistent storage (no external DB server)
+import sqlite3
+# pathlib gives us a path to the project directory so data.db lives next to main.py
+from pathlib import Path
 #imports request library for HTTP requests
 import requests
 #imports Pythons request logging module to log errors
@@ -31,15 +35,62 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
-# In-memory cache for API responses
-# Structure: {"endpoint_name": {"data": response_data, "timestamp": unix_timestamp}}
-# Each cache entry stores the response data and when it was fetched
-cache = {}
+# Path to the SQLite database file in the project directory (next to main.py).
+# Path(__file__).resolve().parent is the folder containing main.py; .parent avoids path being the file itself.
+DB_PATH = Path(__file__).resolve().parent / "data.db"
 
-# Cache TTL (Time To Live) in seconds
-# 5 minutes = 300 seconds
-# Data older than this will be considered expired
+# Cache TTL (Time To Live) in seconds. Same concept as before: data older than this is "stale".
+# 5 minutes = 300 seconds. We compare stored timestamp to current time in the database layer.
 CACHE_TTL = 300
+
+
+def get_connection():
+    """
+    Opens a connection to the SQLite database. Each call creates a new connection;
+    SQLite handles one writer at a time, and we close after each use (no long-lived connection).
+    """
+    # sqlite3.connect() opens the file at DB_PATH; creates the file if it does not exist.
+    return sqlite3.connect(DB_PATH)
+
+
+def init_db():
+    """
+    Creates the database file and tables if they do not exist. Safe to call on every startup.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        # global_metrics: one row for market-wide data. We use id=1 as a single row we overwrite.
+        # updated_at is stored as Unix timestamp (REAL) so we can do TTL: (now - updated_at) < CACHE_TTL.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS global_metrics (
+                id INTEGER PRIMARY KEY,
+                total_market_cap_usd REAL NOT NULL,
+                total_volume_24h_usd REAL NOT NULL,
+                btc_dominance_percent REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        # coins: one row per coin (top 5). id is the coin id from CoinGecko (e.g. "bitcoin").
+        # updated_at is the same for all rows when we do a batch refresh; we use it for TTL.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS coins (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                price_usd REAL,
+                change_24h REAL,
+                volume_24h_usd REAL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        # commit() writes the CREATE TABLE statements to disk.
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Ensure database and tables exist when the app module loads (e.g. on uvicorn start).
+init_db()
 
 #Register a GET route at / (root path)
 @app.get("/")
@@ -167,68 +218,134 @@ def fetch_global_metrics():
 
 def is_cache_valid(cache_key):
     """
-    Checks if cached data for a given key is still valid (not expired).
-    
-    Args:
-        cache_key: String key identifying the cache entry (e.g., "coins", "global")
-    
-    Returns:
-        bool: True if cache exists and is valid, False otherwise
+    Checks if stored data in SQLite is still within TTL (not expired).
+    For "global" we look at the single row in global_metrics; for "coins" we check any row in coins
+    (all coin rows are updated together, so one timestamp represents the whole set).
     """
-    # Check if the cache key exists
-    if cache_key not in cache:
-        # Cache doesn't exist
-        return False
-    
-    # Get the cached entry
-    cache_entry = cache[cache_key]
-    
-    # Get the timestamp when data was cached
-    cached_timestamp = cache_entry.get("timestamp", 0)
-    
-    # Get current time as Unix timestamp (seconds since epoch)
-    current_time = time.time()
-    
-    # Calculate how old the cache is (in seconds)
-    cache_age = current_time - cached_timestamp
-    
-    # Check if cache is older than TTL
-    if cache_age >= CACHE_TTL:
-        # Cache has expired
-        return False
-    
-    # Cache exists and is still valid
-    return True
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        now = time.time()
+        if cache_key == "global":
+            # Select the single global row (id=1). If no row, rowcount/result is empty.
+            cur.execute(
+                "SELECT updated_at FROM global_metrics WHERE id = 1"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            updated_at = row[0]
+        else:
+            # cache_key == "coins": we have 5 rows with same updated_at; any one is enough.
+            cur.execute(
+                "SELECT updated_at FROM coins LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            updated_at = row[0]
+        # TTL check: data is valid only if (now - updated_at) is less than CACHE_TTL.
+        cache_age = now - updated_at
+        return cache_age < CACHE_TTL
+    finally:
+        conn.close()
 
 
 def get_cached_data(cache_key):
     """
-    Retrieves cached data for a given key.
-    
-    Args:
-        cache_key: String key identifying the cache entry
-    
-    Returns:
-        The cached data, or None if not found
+    Reads data from SQLite and returns it in the same shape the endpoints expect
+    (dict for global, list of dicts for coins). Returns None if no data.
     """
-    if cache_key in cache:
-        return cache[cache_key].get("data")
-    return None
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        if cache_key == "global":
+            cur.execute(
+                "SELECT total_market_cap_usd, total_volume_24h_usd, btc_dominance_percent FROM global_metrics WHERE id = 1"
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "total_market_cap_usd": row[0],
+                "total_volume_24h_usd": row[1],
+                "btc_dominance_percent": row[2],
+            }
+        else:
+            # cache_key == "coins": return all rows as list of dicts, same order as API (we can ORDER BY id for stability).
+            cur.execute(
+                "SELECT id, name, price_usd, change_24h, volume_24h_usd FROM coins ORDER BY id"
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return None
+            return [
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "price_usd": r[2],
+                    "change_24h": r[3],
+                    "volume_24h_usd": r[4],
+                }
+                for r in rows
+            ]
+    finally:
+        conn.close()
 
 
 def set_cached_data(cache_key, data):
     """
-    Stores data in the cache with current timestamp.
-    
-    Args:
-        cache_key: String key identifying the cache entry
-        data: The data to cache
+    Writes data into SQLite with current timestamp. Replaces previous data so we always
+    have at most one global row and the current set of coin rows.
     """
-    # Store data with current timestamp
-    cache[cache_key] = {
-        "data": data,
-        "timestamp": time.time()
-    }
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        now = time.time()
+        if cache_key == "global":
+            # REPLACE = insert or overwrite row with id=1 (SQLite REPLACE semantics).
+            cur.execute(
+                """REPLACE INTO global_metrics (id, total_market_cap_usd, total_volume_24h_usd, btc_dominance_percent, updated_at)
+                   VALUES (1, ?, ?, ?, ?)""",
+                (data["total_market_cap_usd"], data["total_volume_24h_usd"], data["btc_dominance_percent"], now),
+            )
+        else:
+            # coins: clear old rows then insert current list so we don't keep stale coins.
+            cur.execute("DELETE FROM coins")
+            for coin in data:
+                cur.execute(
+                    """INSERT INTO coins (id, name, price_usd, change_24h, volume_24h_usd, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        coin["id"],
+                        coin["name"],
+                        coin["price_usd"],
+                        coin["change_24h"],
+                        coin["volume_24h_usd"],
+                        now,
+                    ),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_cache_timestamp(cache_key):
+    """
+    Returns the updated_at (Unix timestamp) for the given key from SQLite, or None.
+    Used by get_summary() to build meta.last_updated from stored data.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        if cache_key == "global":
+            cur.execute("SELECT updated_at FROM global_metrics WHERE id = 1")
+        else:
+            cur.execute("SELECT updated_at FROM coins LIMIT 1")
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 
 @app.get("/bitcoin-price")
@@ -301,7 +418,7 @@ def get_coins():
     """
     Endpoint that returns market data for multiple cryptocurrencies.
     Returns a list of top 5 coins with price, 24h change, and volume.
-    Uses in-memory cache to reduce CoinGecko API calls.
+    Uses SQLite for storage; data persists across restarts. TTL limits freshness.
     """
     cache_key = "coins"
     
@@ -368,7 +485,7 @@ def get_global_metrics():
     """
     Endpoint that returns global cryptocurrency market metrics.
     Returns total market cap, total 24h volume, and BTC dominance.
-    Uses in-memory cache to reduce CoinGecko API calls.
+    Uses SQLite for storage; data persists across restarts. TTL limits freshness.
     """
     cache_key = "global"
     
@@ -440,20 +557,18 @@ def get_global_metrics():
 def get_summary():
     """
     Combined endpoint that returns global metrics and coin list in one response.
-    Reuses the same in-memory cache as /api/coins and /api/global; does not refetch CoinGecko.
+    Uses SQLite for storage; data persists across server restarts.
     """
-    # Check cache state before calling endpoints (so we know if response is from cache)
+    # Check if both datasets are within TTL (from SQLite), so we can set meta.cached.
     cached = is_cache_valid("coins") and is_cache_valid("global")
 
-    # Reuse existing endpoint logic: get_global_metrics() and get_coins() return
-    # cached data when valid, otherwise fetch from CoinGecko, update cache, and return.
-    # No refetch beyond what those endpoints already do.
+    # get_global_metrics() and get_coins() read from DB when valid, else fetch and write to DB.
     global_data = get_global_metrics()
     coins_data = get_coins()
 
-    # last_updated = oldest of the two cache timestamps (ISO string)
-    coins_ts = cache.get("coins", {}).get("timestamp") or 0
-    global_ts = cache.get("global", {}).get("timestamp") or 0
+    # last_updated = oldest of the two stored timestamps (from SQLite), as ISO string.
+    coins_ts = get_cache_timestamp("coins") or 0
+    global_ts = get_cache_timestamp("global") or 0
     last_updated_ts = min(coins_ts, global_ts)
     last_updated = datetime.fromtimestamp(last_updated_ts).isoformat() if last_updated_ts else None
 

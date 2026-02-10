@@ -8,3 +8,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Local SQLite database (generated at runtime)
+data.db
