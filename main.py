@@ -434,3 +434,35 @@ def get_global_metrics():
     # Return the response dictionary
     # FastAPI automatically serializes Python dicts to JSON
     return response
+
+
+@app.get("/api/summary")
+def get_summary():
+    """
+    Combined endpoint that returns global metrics and coin list in one response.
+    Reuses the same in-memory cache as /api/coins and /api/global; does not refetch CoinGecko.
+    """
+    # Check cache state before calling endpoints (so we know if response is from cache)
+    cached = is_cache_valid("coins") and is_cache_valid("global")
+
+    # Reuse existing endpoint logic: get_global_metrics() and get_coins() return
+    # cached data when valid, otherwise fetch from CoinGecko, update cache, and return.
+    # No refetch beyond what those endpoints already do.
+    global_data = get_global_metrics()
+    coins_data = get_coins()
+
+    # last_updated = oldest of the two cache timestamps (ISO string)
+    coins_ts = cache.get("coins", {}).get("timestamp") or 0
+    global_ts = cache.get("global", {}).get("timestamp") or 0
+    last_updated_ts = min(coins_ts, global_ts)
+    last_updated = datetime.fromtimestamp(last_updated_ts).isoformat() if last_updated_ts else None
+
+    return {
+        "global": global_data,
+        "coins": coins_data,
+        "meta": {
+            "cached": cached,
+            "last_updated": last_updated,
+            "ttl_seconds": CACHE_TTL,
+        },
+    }
