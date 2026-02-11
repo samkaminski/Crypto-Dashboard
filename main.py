@@ -10,6 +10,8 @@ import requests
 import logging
 from datetime import datetime
 import time
+# Run the periodic update loop in a separate thread so it does not block request handling.
+import threading
 
 # Set up logging to see error messages
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +44,10 @@ DB_PATH = Path(__file__).resolve().parent / "data.db"
 # Cache TTL (Time To Live) in seconds. Same concept as before: data older than this is "stale".
 # 5 minutes = 300 seconds. We compare stored timestamp to current time in the database layer.
 CACHE_TTL = 300
+
+# How often the background task fetches from CoinGecko and writes to SQLite (seconds).
+# Keeps the database fresh so API endpoints usually serve from DB without refetching.
+BACKGROUND_UPDATE_INTERVAL_SECONDS = 300
 
 
 def get_connection():
@@ -216,6 +222,49 @@ def fetch_global_metrics():
         return None
 
 
+def _build_global_response(global_data_raw):
+    """
+    Converts raw CoinGecko /global response into our API shape.
+    Returns a dict with total_market_cap_usd, total_volume_24h_usd, btc_dominance_percent, or None if invalid.
+    Shared by get_global_metrics (on cache miss) and the background update cycle.
+    """
+    if global_data_raw is None:
+        return None
+    data = global_data_raw.get("data", {})
+    total_market_cap = data.get("total_market_cap", {})
+    total_market_cap_usd = total_market_cap.get("usd")
+    total_volume = data.get("total_volume", {})
+    total_volume_24h_usd = total_volume.get("usd")
+    market_cap_percentage = data.get("market_cap_percentage", {})
+    btc_dominance_percent = market_cap_percentage.get("btc")
+    if total_market_cap_usd is None or total_volume_24h_usd is None or btc_dominance_percent is None:
+        return None
+    return {
+        "total_market_cap_usd": total_market_cap_usd,
+        "total_volume_24h_usd": total_volume_24h_usd,
+        "btc_dominance_percent": btc_dominance_percent,
+    }
+
+
+def _build_coins_list(coins_data_raw):
+    """
+    Converts raw CoinGecko /coins/markets response into our API shape (list of dicts).
+    Returns the list or None if invalid. Shared by get_coins (on cache miss) and the background update cycle.
+    """
+    if coins_data_raw is None or not isinstance(coins_data_raw, list):
+        return None
+    transformed = []
+    for coin in coins_data_raw:
+        transformed.append({
+            "id": coin.get("id"),
+            "name": coin.get("name"),
+            "price_usd": coin.get("current_price"),
+            "change_24h": coin.get("price_change_percentage_24h"),
+            "volume_24h_usd": coin.get("total_volume"),
+        })
+    return transformed if transformed else None
+
+
 def is_cache_valid(cache_key):
     """
     Checks if stored data in SQLite is still within TTL (not expired).
@@ -348,6 +397,58 @@ def get_cache_timestamp(cache_key):
         conn.close()
 
 
+def run_one_update_cycle():
+    """
+    Fetches global and coin data from CoinGecko, then writes both to SQLite.
+    Used by the background thread so the DB stays fresh without blocking requests.
+    Logs when each database write happens. Exceptions are logged and not re-raised.
+    """
+    logger.info("Running background update cycle")
+    # Fetch and write global metrics.
+    global_data_raw = fetch_global_metrics()
+    global_response = _build_global_response(global_data_raw)
+    if global_response is not None:
+        set_cached_data("global", global_response)
+        logger.info("Database updated: global")
+    else:
+        logger.warning("Background update: global fetch or build failed, skipping global write")
+    # Fetch and write coins.
+    coins_data_raw = fetch_multiple_coins()
+    coins_list = _build_coins_list(coins_data_raw)
+    if coins_list is not None:
+        set_cached_data("coins", coins_list)
+        logger.info("Database updated: coins")
+    else:
+        logger.warning("Background update: coins fetch or build failed, skipping coins write")
+
+
+def background_update_loop():
+    """
+    Infinite loop that runs run_one_update_cycle() every BACKGROUND_UPDATE_INTERVAL_SECONDS.
+    Runs in a daemon thread so it does not block the main thread (request handling).
+    time.sleep() blocks only this thread; the main thread continues serving requests.
+    """
+    logger.info("Background update task started (interval=%s seconds)", BACKGROUND_UPDATE_INTERVAL_SECONDS)
+    while True:
+        try:
+            run_one_update_cycle()
+        except Exception as e:
+            logger.exception("Background update cycle failed: %s", e)
+        time.sleep(BACKGROUND_UPDATE_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def start_background_updater():
+    """
+    FastAPI startup event: runs once when the app is ready. We start the background
+    update loop in a daemon thread so it runs alongside the main thread that handles HTTP.
+    daemon=True means the thread will not keep the process alive if the main thread exits.
+    """
+    thread = threading.Thread(target=background_update_loop, daemon=True)
+    thread.start()
+    logger.info("Background update task registered; thread started")
+
+
 @app.get("/bitcoin-price")
 def get_bitcoin_price():
     """
@@ -432,51 +533,15 @@ def get_coins():
     # Cache miss or expired - fetch fresh data from CoinGecko
     logger.info(f"Cache MISS for {cache_key} - fetching from CoinGecko")
     
-    # Call the function to fetch multiple coins from CoinGecko
-    coins_data = fetch_multiple_coins()
-    
-    # If fetch_multiple_coins() returned None, the API call failed
-    if coins_data is None:
-        # Raise HTTPException with status code 502 (Bad Gateway)
-        # This indicates the server received an invalid response from upstream
+    coins_data_raw = fetch_multiple_coins()
+    transformed_coins = _build_coins_list(coins_data_raw)
+    if transformed_coins is None:
         raise HTTPException(
             status_code=502,
             detail="Failed to fetch coin data from CoinGecko API"
         )
-    
-    # Transform the CoinGecko response into our clean format
-    # CoinGecko returns an array, so we iterate through each coin
-    transformed_coins = []
-    
-    for coin in coins_data:
-        # Extract and transform each field from CoinGecko's format to our format
-        # CoinGecko uses different field names, so we map them
-        
-        # coin.get() safely retrieves values, with None as default if missing
-        coin_id = coin.get("id")  # e.g., "bitcoin"
-        coin_name = coin.get("name")  # e.g., "Bitcoin"
-        price_usd = coin.get("current_price")  # e.g., 45000.50
-        change_24h = coin.get("price_change_percentage_24h")  # e.g., 2.5 (percentage)
-        volume_24h_usd = coin.get("total_volume")  # e.g., 25000000000 (in USD)
-        
-        # Build a clean coin object with our standardized field names
-        transformed_coin = {
-            "id": coin_id,
-            "name": coin_name,
-            "price_usd": price_usd,
-            "change_24h": change_24h,
-            "volume_24h_usd": volume_24h_usd
-        }
-        
-        # Add this coin to our result list
-        transformed_coins.append(transformed_coin)
-    
-    # Store the transformed data in cache for future requests
     set_cached_data(cache_key, transformed_coins)
     logger.info(f"Cached data for {cache_key} with TTL of {CACHE_TTL} seconds")
-    
-    # Return the list of transformed coins
-    # FastAPI automatically serializes Python lists to JSON arrays
     return transformed_coins
 
 
@@ -499,57 +564,15 @@ def get_global_metrics():
     # Cache miss or expired - fetch fresh data from CoinGecko
     logger.info(f"Cache MISS for {cache_key} - fetching from CoinGecko")
     
-    # Call the function to fetch global metrics from CoinGecko
-    global_data = fetch_global_metrics()
-    
-    # If fetch_global_metrics() returned None, the API call failed
-    if global_data is None:
-        # Raise HTTPException with status code 502 (Bad Gateway)
-        # This indicates the server received an invalid response from upstream
+    global_data_raw = fetch_global_metrics()
+    response = _build_global_response(global_data_raw)
+    if response is None:
         raise HTTPException(
             status_code=502,
             detail="Failed to fetch global metrics from CoinGecko API"
         )
-    
-    # Extract the nested data object from CoinGecko's response
-    # CoinGecko wraps everything in a "data" key
-    data = global_data.get("data", {})
-    
-    # Extract total market cap in USD
-    # Structure: data.total_market_cap.usd
-    total_market_cap = data.get("total_market_cap", {})
-    total_market_cap_usd = total_market_cap.get("usd")
-    
-    # Extract total 24h volume in USD
-    # Structure: data.total_volume.usd
-    total_volume = data.get("total_volume", {})
-    total_volume_24h_usd = total_volume.get("usd")
-    
-    # Extract BTC dominance percentage
-    # Structure: data.market_cap_percentage.btc
-    market_cap_percentage = data.get("market_cap_percentage", {})
-    btc_dominance_percent = market_cap_percentage.get("btc")
-    
-    # Check if any required fields are missing
-    if total_market_cap_usd is None or total_volume_24h_usd is None or btc_dominance_percent is None:
-        raise HTTPException(
-            status_code=502,
-            detail="Invalid data received from CoinGecko API"
-        )
-    
-    # Build a clean response object with standardized field names
-    response = {
-        "total_market_cap_usd": total_market_cap_usd,
-        "total_volume_24h_usd": total_volume_24h_usd,
-        "btc_dominance_percent": btc_dominance_percent
-    }
-    
-    # Store the response in cache for future requests
     set_cached_data(cache_key, response)
     logger.info(f"Cached data for {cache_key} with TTL of {CACHE_TTL} seconds")
-    
-    # Return the response dictionary
-    # FastAPI automatically serializes Python dicts to JSON
     return response
 
 
