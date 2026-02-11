@@ -222,6 +222,65 @@ def fetch_global_metrics():
         return None
 
 
+def fetch_coin_history(coin_id):
+    """
+    Fetches ~30 days of historical price data for a coin from CoinGecko's market_chart endpoint.
+
+    CoinGecko endpoint: GET /coins/{id}/market_chart?vs_currency=usd&days=30
+    - {id}: the coin ID (e.g. bitcoin, ethereum)
+    - vs_currency=usd: prices in USD
+    - days=30: last 30 days
+
+    Raw response shape:
+    {
+      "prices": [[1704067200000, 42000.50], [1704153600000, 42510.75], ...],
+      "market_caps": [[ts, cap], ...],
+      "total_volumes": [[ts, vol], ...]
+    }
+    Each "prices" element is [timestamp_ms, price] where timestamp is Unix milliseconds.
+
+    Returns:
+        list: List of [timestamp_ms, price] pairs, or None on error
+    """
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=30"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code != 200:
+            logger.error(f"CoinGecko API returned status code {response.status_code} for coin_id={coin_id}")
+            return None
+        data = response.json()
+        prices = data.get("prices")
+        if not prices or not isinstance(prices, list):
+            logger.error(f"CoinGecko returned no prices for coin_id={coin_id}")
+            return None
+        return prices
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching history for {coin_id}: {e}")
+        return None
+
+
+def _build_history_response(prices_raw):
+    """
+    Converts raw prices [[timestamp_ms, price], ...] into our API format.
+    - timestamp_ms: Unix time in milliseconds; divide by 1000 for seconds, then use datetime.
+    - price: ensure float for JSON.
+    Returns sorted list of {"date": "YYYY-MM-DD", "price_usd": float}.
+    """
+    if not prices_raw:
+        return []
+    result = []
+    for item in prices_raw:
+        ts_ms = item[0]
+        price = item[1]
+        # Convert ms -> seconds for datetime. Use UTC to match typical financial data.
+        dt = datetime.utcfromtimestamp(ts_ms / 1000)
+        date_str = dt.strftime("%Y-%m-%d")
+        result.append({"date": date_str, "price_usd": float(price)})
+    # Sort by date (string sort works for YYYY-MM-DD)
+    result.sort(key=lambda x: x["date"])
+    return result
+
+
 def _build_global_response(global_data_raw):
     """
     Converts raw CoinGecko /global response into our API shape.
@@ -574,6 +633,23 @@ def get_global_metrics():
     set_cached_data(cache_key, response)
     logger.info(f"Cached data for {cache_key} with TTL of {CACHE_TTL} seconds")
     return response
+
+
+@app.get("/api/history/{coin_id}")
+def get_coin_history(coin_id: str):
+    """
+    Returns ~30 days of historical price data for a coin. Fetch-only (no SQLite storage).
+    """
+    if not coin_id or not coin_id.strip():
+        raise HTTPException(status_code=404, detail="Invalid coin ID")
+    coin_id = coin_id.strip().lower()
+    prices_raw = fetch_coin_history(coin_id)
+    if prices_raw is None:
+        raise HTTPException(status_code=502, detail="Failed to fetch historical data from CoinGecko")
+    history = _build_history_response(prices_raw)
+    if not history:
+        raise HTTPException(status_code=404, detail=f"No history found for coin: {coin_id}")
+    return history
 
 
 @app.get("/api/summary")
