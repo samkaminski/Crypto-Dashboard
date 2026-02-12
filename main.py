@@ -12,6 +12,8 @@ from datetime import datetime
 import time
 # Run the periodic update loop in a separate thread so it does not block request handling.
 import threading
+# For volatility: standard deviation of daily returns (no numpy/pandas).
+import statistics
 
 # Set up logging to see error messages
 logging.basicConfig(level=logging.INFO)
@@ -279,6 +281,51 @@ def _build_history_response(prices_raw):
     # Sort by date (string sort works for YYYY-MM-DD)
     result.sort(key=lambda x: x["date"])
     return result
+
+
+def calculate_volatility(history):
+    """
+    Computes 30-day volatility from a list of {date, price_usd} objects.
+
+    Daily return: r_t = (price_today / price_yesterday) - 1
+    - Measures percentage change from one day to the next.
+    - Volatility = standard deviation of these daily returns (how much returns vary day-to-day).
+
+    Uses sample standard deviation (statistics.stdev): we have a sample of historical returns,
+    not the full population, so divide by (n-1) for an unbiased estimate.
+
+    Returns:
+        float: Volatility as a percentage (e.g. 5.20 for 5.20%), or None if cannot compute.
+    """
+    if not history or len(history) < 2:
+        return None
+    returns = []
+    for i in range(1, len(history)):
+        prev = history[i - 1].get("price_usd")
+        curr = history[i].get("price_usd")
+        if prev is None or curr is None:
+            continue
+        try:
+            prev_f = float(prev)
+            curr_f = float(curr)
+        except (TypeError, ValueError):
+            continue
+        if prev_f <= 0:
+            continue
+        daily_return = (curr_f / prev_f) - 1
+        returns.append(daily_return)
+    if len(returns) < 2:
+        return None
+    vol_decimal = statistics.stdev(returns)
+    return round(vol_decimal * 100, 2)
+
+
+# Verification (run manually): python -c "
+# from main import calculate_volatility
+# # Prices 100, 102, 101 -> returns [0.02, -0.0098] -> stdev ~2.09%
+# h = [{'date':'a','price_usd':100},{'date':'b','price_usd':102},{'date':'c','price_usd':101}]
+# print(calculate_volatility(h))  # expect ~2.09
+# "
 
 
 def _build_global_response(global_data_raw):
@@ -650,6 +697,26 @@ def get_coin_history(coin_id: str):
     if not history:
         raise HTTPException(status_code=404, detail=f"No history found for coin: {coin_id}")
     return history
+
+
+@app.get("/api/volatility/{coin_id}")
+def get_coin_volatility(coin_id: str):
+    """
+    Returns 30-day volatility (std dev of daily returns) for a coin. Calculation on demand, no SQLite storage.
+    """
+    if not coin_id or not coin_id.strip():
+        raise HTTPException(status_code=400, detail="Invalid coin ID")
+    coin_id = coin_id.strip().lower()
+    prices_raw = fetch_coin_history(coin_id)
+    if prices_raw is None:
+        raise HTTPException(status_code=502, detail="Failed to fetch historical data from CoinGecko")
+    history = _build_history_response(prices_raw)
+    if len(history) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 price points required to compute volatility")
+    vol = calculate_volatility(history)
+    if vol is None:
+        raise HTTPException(status_code=400, detail="Could not compute volatility (insufficient valid returns)")
+    return {"coin": coin_id, "volatility_30d": vol}
 
 
 @app.get("/api/summary")
