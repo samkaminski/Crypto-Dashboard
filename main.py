@@ -81,6 +81,7 @@ def init_db():
         """)
         # coins: one row per coin (top 5). id is the coin id from CoinGecko (e.g. "bitcoin").
         # updated_at is the same for all rows when we do a batch refresh; we use it for TTL.
+        # volatility_30d: precomputed 30-day volatility (std dev of daily returns), stored as percentage (REAL).
         cur.execute("""
             CREATE TABLE IF NOT EXISTS coins (
                 id TEXT PRIMARY KEY,
@@ -88,10 +89,17 @@ def init_db():
                 price_usd REAL,
                 change_24h REAL,
                 volume_24h_usd REAL,
+                volatility_30d REAL,
                 updated_at REAL NOT NULL
             )
         """)
-        # commit() writes the CREATE TABLE statements to disk.
+        # Migration: add volatility_30d if table already existed without it.
+        # SQLite does not support IF NOT EXISTS for columns; we check PRAGMA table_info and ALTER only when missing.
+        cur.execute("PRAGMA table_info(coins)")
+        columns = [row[1] for row in cur.fetchall()]
+        if "volatility_30d" not in columns:
+            cur.execute("ALTER TABLE coins ADD COLUMN volatility_30d REAL")
+        # commit() writes the CREATE TABLE and any ALTER TABLE to disk.
         conn.commit()
     finally:
         conn.close()
@@ -371,6 +379,32 @@ def _build_coins_list(coins_data_raw):
     return transformed if transformed else None
 
 
+def _enrich_coins_with_volatility(coins_list):
+    """
+    Adds volatility_30d to each coin by fetching 30-day history and computing volatility.
+    Reuses fetch_coin_history, _build_history_response, and calculate_volatility.
+    If volatility cannot be computed for a coin, sets volatility_30d to None (stored as NULL in DB).
+    Errors in one coin do not abort the rest; each coin is tried independently.
+    """
+    if not coins_list:
+        return coins_list
+    result = []
+    for coin in coins_list:
+        c = dict(coin)
+        vol = None
+        try:
+            coin_id = c.get("id")
+            if coin_id:
+                prices_raw = fetch_coin_history(coin_id)
+                history = _build_history_response(prices_raw) if prices_raw else []
+                vol = calculate_volatility(history)
+        except Exception as e:
+            logger.warning("Could not compute volatility for %s: %s", c.get("id"), e)
+        c["volatility_30d"] = vol
+        result.append(c)
+    return result
+
+
 def is_cache_valid(cache_key):
     """
     Checks if stored data in SQLite is still within TTL (not expired).
@@ -427,9 +461,10 @@ def get_cached_data(cache_key):
                 "btc_dominance_percent": row[2],
             }
         else:
-            # cache_key == "coins": return all rows as list of dicts, same order as API (we can ORDER BY id for stability).
+            # cache_key == "coins": return all rows as list of dicts, same order as API (ORDER BY id for stability).
+            # volatility_30d comes from DB (precomputed during background update).
             cur.execute(
-                "SELECT id, name, price_usd, change_24h, volume_24h_usd FROM coins ORDER BY id"
+                "SELECT id, name, price_usd, change_24h, volume_24h_usd, volatility_30d FROM coins ORDER BY id"
             )
             rows = cur.fetchall()
             if not rows:
@@ -441,6 +476,7 @@ def get_cached_data(cache_key):
                     "price_usd": r[2],
                     "change_24h": r[3],
                     "volume_24h_usd": r[4],
+                    "volatility_30d": r[5],
                 }
                 for r in rows
             ]
@@ -468,15 +504,17 @@ def set_cached_data(cache_key, data):
             # coins: clear old rows then insert current list so we don't keep stale coins.
             cur.execute("DELETE FROM coins")
             for coin in data:
+                vol = coin.get("volatility_30d")
                 cur.execute(
-                    """INSERT INTO coins (id, name, price_usd, change_24h, volume_24h_usd, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO coins (id, name, price_usd, change_24h, volume_24h_usd, volatility_30d, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (
                         coin["id"],
                         coin["name"],
                         coin["price_usd"],
                         coin["change_24h"],
                         coin["volume_24h_usd"],
+                        vol,
                         now,
                     ),
                 )
@@ -518,10 +556,11 @@ def run_one_update_cycle():
         logger.info("Database updated: global")
     else:
         logger.warning("Background update: global fetch or build failed, skipping global write")
-    # Fetch and write coins.
+    # Fetch and write coins (including volatility computed from 30-day history).
     coins_data_raw = fetch_multiple_coins()
     coins_list = _build_coins_list(coins_data_raw)
     if coins_list is not None:
+        coins_list = _enrich_coins_with_volatility(coins_list)
         set_cached_data("coins", coins_list)
         logger.info("Database updated: coins")
     else:
@@ -636,7 +675,7 @@ def get_coins():
         logger.info(f"Cache HIT for {cache_key} - returning cached data")
         return cached_data
     
-    # Cache miss or expired - fetch fresh data from CoinGecko
+    # Cache miss or expired - fetch fresh data from CoinGecko and compute volatility
     logger.info(f"Cache MISS for {cache_key} - fetching from CoinGecko")
     
     coins_data_raw = fetch_multiple_coins()
@@ -646,6 +685,7 @@ def get_coins():
             status_code=502,
             detail="Failed to fetch coin data from CoinGecko API"
         )
+    transformed_coins = _enrich_coins_with_volatility(transformed_coins)
     set_cached_data(cache_key, transformed_coins)
     logger.info(f"Cached data for {cache_key} with TTL of {CACHE_TTL} seconds")
     return transformed_coins
