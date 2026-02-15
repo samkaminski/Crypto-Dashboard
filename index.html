@@ -89,6 +89,9 @@
         .coin-name {
             font-weight: bold;
         }
+        .num-cell {
+            text-align: right;
+        }
         .summary-timestamp {
             font-size: 0.85em;
             color: #666;
@@ -143,6 +146,16 @@
             // toFixed(2) rounds to 2 decimal places
             // Add the % symbol at the end
             return value.toFixed(2) + '%';
+        }
+
+        // Formats volatility as a percentage. Handles null/undefined/missing.
+        function formatVolatility(value) {
+            if (value == null || value === undefined || (typeof value === 'number' && isNaN(value))) {
+                return 'N/A';
+            }
+            const num = Number(value);
+            if (isNaN(num)) return 'N/A';
+            return Math.abs(num).toFixed(2) + '%';
         }
         
         // Function to format a large number (for volume)
@@ -201,11 +214,13 @@
         function renderCoinsTable(coins) {
             if (!Array.isArray(coins) || coins.length === 0) return;
             let tableHTML = '<table><thead><tr>';
-            tableHTML += '<th>Coin Name</th><th>Price (USD)</th><th>24h Change (%)</th><th>24h Volume (USD)</th></tr></thead><tbody>';
+            tableHTML += '<th>Coin Name</th><th class="num-cell">Price (USD)</th><th class="num-cell">24h Change (%)</th>';
+            tableHTML += '<th class="num-cell">24h Volume (USD)</th><th class="num-cell">30d Volatility (%)</th></tr></thead><tbody>';
             coins.forEach(function(coin) {
                 const changeClass = (coin.change_24h >= 0) ? 'positive' : 'negative';
-                tableHTML += `<tr><td class="coin-name">${coin.name}</td><td>${formatCurrency(coin.price_usd)}</td>`;
-                tableHTML += `<td class="${changeClass}">${formatPercent(coin.change_24h)}</td><td>${formatVolume(coin.volume_24h_usd)}</td></tr>`;
+                tableHTML += `<tr><td class="coin-name">${coin.name}</td><td class="num-cell">${formatCurrency(coin.price_usd)}</td>`;
+                tableHTML += `<td class="num-cell ${changeClass}">${formatPercent(coin.change_24h)}</td><td class="num-cell">${formatVolume(coin.volume_24h_usd)}</td>`;
+                tableHTML += `<td class="num-cell">${formatVolatility(coin.volatility_30d)}</td></tr>`;
             });
             tableHTML += '</tbody></table>';
             contentDiv.className = '';
