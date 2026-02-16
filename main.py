@@ -99,6 +99,16 @@ def init_db():
         columns = [row[1] for row in cur.fetchall()]
         if "volatility_30d" not in columns:
             cur.execute("ALTER TABLE coins ADD COLUMN volatility_30d REAL")
+        # historical_prices: 30-day price history per coin. Populated by background task for correlation/volatility.
+        # coin_id + date form logical uniqueness; we DELETE then INSERT to refresh (no unbounded growth).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS historical_prices (
+                id INTEGER PRIMARY KEY,
+                coin_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                price_usd REAL NOT NULL
+            )
+        """)
         # commit() writes the CREATE TABLE and any ALTER TABLE to disk.
         conn.commit()
     finally:
@@ -336,6 +346,83 @@ def calculate_volatility(history):
 # "
 
 
+def calculate_correlation(series_a, series_b):
+    """
+    Pearson correlation between two aligned price series. Uses daily returns, not raw prices.
+
+    Why returns: Raw prices are non-stationary (both coins trend up over time). Correlation of
+    prices would be high even if they move independently. Returns measure day-to-day % change;
+    correlation of returns answers "when A goes up 1%, does B tend to go up too?"
+
+    Formula: r = Cov(X,Y) / (sigma_X * sigma_Y)
+    Expanded: r = sum((x_i - x_mean)(y_i - y_mean)) / sqrt(sum((x_i - x_mean)^2) * sum((y_i - y_mean)^2))
+    Result is between -1 (perfect inverse) and 1 (perfect positive). 0 = no linear relationship.
+
+    Steps:
+    1. Compute daily returns for each series.
+    2. Mean of each return series.
+    3. Numerator: sum of (x_i - mean_x) * (y_i - mean_y).
+    4. Denominator: sqrt(sum (x_i - mean_x)^2 * sum (y_i - mean_y)^2).
+    5. r = numerator / denominator (return 0.0 if denominator is 0).
+    """
+    if not series_a or not series_b or len(series_a) != len(series_b):
+        return None
+    n = len(series_a)
+    if n < 2:
+        return None
+    returns_a = []
+    returns_b = []
+    for i in range(1, n):
+        prev_a = series_a[i - 1]
+        curr_a = series_a[i]
+        prev_b = series_b[i - 1]
+        curr_b = series_b[i]
+        if prev_a is None or prev_b is None or prev_a <= 0 or prev_b <= 0:
+            continue
+        try:
+            ra = (float(curr_a) / float(prev_a)) - 1
+            rb = (float(curr_b) / float(prev_b)) - 1
+        except (TypeError, ValueError):
+            continue
+        returns_a.append(ra)
+        returns_b.append(rb)
+    if len(returns_a) < 2:
+        return None
+    mean_a = sum(returns_a) / len(returns_a)
+    mean_b = sum(returns_b) / len(returns_b)
+    num = sum((a - mean_a) * (b - mean_b) for a, b in zip(returns_a, returns_b))
+    var_a = sum((a - mean_a) ** 2 for a in returns_a)
+    var_b = sum((b - mean_b) ** 2 for b in returns_b)
+    denom = (var_a * var_b) ** 0.5
+    if denom <= 0:
+        return 0.0
+    r = num / denom
+    r = max(-1.0, min(1.0, r))
+    return round(r, 4)
+
+
+# Correlation verification: python -c "
+# from main import calculate_correlation
+# # [1,2,3] and [2,4,6]: returns both [1, 0.5] -> perfectly correlated
+# print(calculate_correlation([1,2,3], [2,4,6]))  # expect 1.0
+# "
+
+
+def _align_histories_by_date(history_a, history_b):
+    """
+    Aligns two history lists by date. Returns (series_a, series_b) of aligned prices,
+    or ([], []) if insufficient overlap. Only dates present in BOTH series are used.
+    """
+    if not history_a or not history_b:
+        return [], []
+    dict_a = {h["date"]: h.get("price_usd") for h in history_a}
+    dict_b = {h["date"]: h.get("price_usd") for h in history_b}
+    common = sorted(set(dict_a.keys()) & set(dict_b.keys()))
+    series_a = [dict_a[d] for d in common]
+    series_b = [dict_b[d] for d in common]
+    return series_a, series_b
+
+
 def _build_global_response(global_data_raw):
     """
     Converts raw CoinGecko /global response into our API shape.
@@ -382,6 +469,7 @@ def _build_coins_list(coins_data_raw):
 def _enrich_coins_with_volatility(coins_list):
     """
     Adds volatility_30d to each coin by fetching 30-day history and computing volatility.
+    Also stores history in historical_prices so the correlation endpoint can read from DB.
     Reuses fetch_coin_history, _build_history_response, and calculate_volatility.
     If volatility cannot be computed for a coin, sets volatility_30d to None (stored as NULL in DB).
     Errors in one coin do not abort the rest; each coin is tried independently.
@@ -397,6 +485,7 @@ def _enrich_coins_with_volatility(coins_list):
             if coin_id:
                 prices_raw = fetch_coin_history(coin_id)
                 history = _build_history_response(prices_raw) if prices_raw else []
+                store_historical_prices(coin_id, history)
                 vol = calculate_volatility(history)
         except Exception as e:
             logger.warning("Could not compute volatility for %s: %s", c.get("id"), e)
@@ -537,6 +626,48 @@ def get_cache_timestamp(cache_key):
             cur.execute("SELECT updated_at FROM coins LIMIT 1")
         row = cur.fetchone()
         return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def store_historical_prices(coin_id, history):
+    """
+    Writes 30-day price history to historical_prices. Replaces existing rows for this coin.
+    DELETE then INSERT avoids duplicates and keeps the table bounded (we only store ~30 rows per coin).
+    """
+    if not coin_id or not history:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM historical_prices WHERE coin_id = ?", (coin_id,))
+        for h in history:
+            date_val = h.get("date")
+            price_val = h.get("price_usd")
+            if date_val is not None and price_val is not None:
+                cur.execute(
+                    "INSERT INTO historical_prices (coin_id, date, price_usd) VALUES (?, ?, ?)",
+                    (coin_id, date_val, float(price_val)),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_historical_prices_from_db(coin_id):
+    """
+    Reads 30-day price history from SQLite. Returns list of {date, price_usd} or empty list.
+    Used by correlation endpoint so it does not call CoinGecko.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT date, price_usd FROM historical_prices WHERE coin_id = ? ORDER BY date",
+            (coin_id,),
+        )
+        rows = cur.fetchall()
+        return [{"date": r[0], "price_usd": r[1]} for r in rows]
     finally:
         conn.close()
 
@@ -757,6 +888,37 @@ def get_coin_volatility(coin_id: str):
     if vol is None:
         raise HTTPException(status_code=400, detail="Could not compute volatility (insufficient valid returns)")
     return {"coin": coin_id, "volatility_30d": vol}
+
+
+@app.get("/api/correlation/{coin_a}/{coin_b}")
+def get_correlation(coin_a: str, coin_b: str):
+    """
+    Returns 30-day Pearson correlation between two coins. Reads from SQLite; does NOT call CoinGecko.
+    Historical data is populated by the background task. Avoids 429 rate limits and works when CoinGecko is down.
+    """
+    if not coin_a or not coin_a.strip() or not coin_b or not coin_b.strip():
+        raise HTTPException(status_code=400, detail="Invalid coin ID")
+    coin_a = coin_a.strip().lower()
+    coin_b = coin_b.strip().lower()
+    history_a = get_historical_prices_from_db(coin_a)
+    history_b = get_historical_prices_from_db(coin_b)
+    if not history_a:
+        raise HTTPException(status_code=400, detail=f"No historical data for coin: {coin_a}")
+    if not history_b:
+        raise HTTPException(status_code=400, detail=f"No historical data for coin: {coin_b}")
+    series_a, series_b = _align_histories_by_date(history_a, history_b)
+    if len(series_a) < 3 or len(series_b) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Insufficient overlapping data (need at least 3 aligned days)",
+        )
+    corr = calculate_correlation(series_a, series_b)
+    if corr is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not compute correlation (insufficient valid returns)",
+        )
+    return {"coin_a": coin_a, "coin_b": coin_b, "correlation_30d": corr}
 
 
 @app.get("/api/summary")
