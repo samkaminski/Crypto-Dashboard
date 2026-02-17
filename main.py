@@ -109,6 +109,18 @@ def init_db():
                 price_usd REAL NOT NULL
             )
         """)
+        # correlations: precomputed Pearson correlation between pairs. Populated by background task.
+        # coin_a and coin_b identify the pair (we store both for bidirectional lookup).
+        # last_updated marks when the value was computed (useful for TTL/cache logic).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS correlations (
+                id INTEGER PRIMARY KEY,
+                coin_a TEXT NOT NULL,
+                coin_b TEXT NOT NULL,
+                correlation_30d REAL NOT NULL,
+                last_updated REAL NOT NULL
+            )
+        """)
         # commit() writes the CREATE TABLE and any ALTER TABLE to disk.
         conn.commit()
     finally:
@@ -672,6 +684,79 @@ def get_historical_prices_from_db(coin_id):
         conn.close()
 
 
+def store_correlation(coin_a, coin_b, correlation_value):
+    """
+    Writes a single correlation to the correlations table. Replaces any existing row for this pair.
+    DELETE then INSERT keeps one row per pair and prevents unbounded growth.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM correlations WHERE coin_a = ? AND coin_b = ?",
+            (coin_a, coin_b),
+        )
+        now = time.time()
+        cur.execute(
+            "INSERT INTO correlations (coin_a, coin_b, correlation_30d, last_updated) VALUES (?, ?, ?, ?)",
+            (coin_a, coin_b, correlation_value, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_stored_correlation(coin_a, coin_b):
+    """
+    Reads a precomputed correlation from the database. Returns the float value or None if not found.
+    Checks both orderings (a,b) and (b,a) since we may have stored either.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT correlation_30d FROM correlations WHERE (coin_a = ? AND coin_b = ?) OR (coin_a = ? AND coin_b = ?)",
+            (coin_a, coin_b, coin_b, coin_a),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def compute_and_store_correlations(coins_list):
+    """
+    Computes correlation between Bitcoin and each other top coin, then stores in the database.
+    Runs after historical_prices is populated (by _enrich_coins_with_volatility).
+    Reuses get_historical_prices_from_db, _align_histories_by_date, and calculate_correlation.
+    """
+    if not coins_list:
+        return
+    coin_ids = [c.get("id") for c in coins_list if c.get("id")]
+    if "bitcoin" not in coin_ids:
+        return
+    history_btc = get_historical_prices_from_db("bitcoin")
+    if not history_btc:
+        logger.warning("No BTC history for correlation computation, skipping")
+        return
+    for coin in coins_list:
+        coin_id = coin.get("id")
+        if not coin_id or coin_id == "bitcoin":
+            continue
+        history_coin = get_historical_prices_from_db(coin_id)
+        if not history_coin:
+            continue
+        series_a, series_b = _align_histories_by_date(history_btc, history_coin)
+        if len(series_a) < 3 or len(series_b) < 3:
+            continue
+        corr = calculate_correlation(series_a, series_b)
+        if corr is None:
+            continue
+        logger.info("Computed correlation BTC-%s: %s", coin_id.upper(), corr)
+        store_correlation("bitcoin", coin_id, corr)
+        logger.info("Stored correlation BTC-%s in database", coin_id.upper())
+
+
 def run_one_update_cycle():
     """
     Fetches global and coin data from CoinGecko, then writes both to SQLite.
@@ -694,6 +779,7 @@ def run_one_update_cycle():
         coins_list = _enrich_coins_with_volatility(coins_list)
         set_cached_data("coins", coins_list)
         logger.info("Database updated: coins")
+        compute_and_store_correlations(coins_list)
     else:
         logger.warning("Background update: coins fetch or build failed, skipping coins write")
 
