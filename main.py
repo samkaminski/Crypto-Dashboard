@@ -724,6 +724,34 @@ def get_stored_correlation(coin_a, coin_b):
         conn.close()
 
 
+def get_all_correlations():
+    """
+    Reads all stored correlations from the database. Returns list of dicts.
+    Separating DB access improves clarity, testability, and reuse.
+    This endpoint only reads precomputed data; no calculations or external API calls.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT coin_a, coin_b, correlation_30d, last_updated FROM correlations ORDER BY coin_a, coin_b"
+        )
+        rows = cur.fetchall()
+        result = []
+        for r in rows:
+            ts = r[3]
+            iso_str = datetime.fromtimestamp(ts).isoformat() if ts else None
+            result.append({
+                "coin_a": r[0],
+                "coin_b": r[1],
+                "correlation_30d": float(r[2]),
+                "last_updated": iso_str,
+            })
+        return result
+    finally:
+        conn.close()
+
+
 def compute_and_store_correlations(coins_list):
     """
     Computes correlation between Bitcoin and each other top coin, then stores in the database.
@@ -1005,6 +1033,20 @@ def get_correlation(coin_a: str, coin_b: str):
             detail="Could not compute correlation (insufficient valid returns)",
         )
     return {"coin_a": coin_a, "coin_b": coin_b, "correlation_30d": corr}
+
+
+@app.get("/api/correlations")
+def get_correlations():
+    """
+    Returns all stored correlations from the database. Read-only; no computation or CoinGecko calls.
+    """
+    try:
+        data = get_all_correlations()
+        logger.info("Serving correlations from database")
+        return data
+    except Exception as e:
+        logger.exception("Database error serving correlations: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to load correlations from database")
 
 
 @app.get("/api/summary")
