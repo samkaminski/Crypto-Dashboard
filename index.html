@@ -97,6 +97,26 @@
             color: #666;
             margin-top: 12px;
         }
+        /* Correlation section: matches global-summary styling for visual consistency */
+        #correlation-section {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #f9f9f9;
+        }
+        #correlation-section h2 {
+            margin-top: 0;
+            color: #333;
+            font-size: 1.2em;
+        }
+        .correlation-row {
+            padding: 6px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .correlation-row:last-child {
+            border-bottom: none;
+        }
     </style>
 </head>
 <body>
@@ -114,15 +134,24 @@
         <div id="content" class="loading">Loading coin data...</div>
     </div>
 
+    <!-- 30-Day Correlations: placed below coin table so user sees price/volatility first, then correlations -->
+    <div id="correlation-section">
+        <h2>30-Day Correlations</h2>
+        <div id="correlation-content" class="loading">Loading...</div>
+    </div>
+
     <script>
         // Single endpoint for dashboard data (global + coins + meta). Used for initial load and polling.
         const SUMMARY_API_URL = 'http://localhost:8000/api/summary';
+        // Correlation endpoint: returns [{coin_a, coin_b, correlation_30d, last_updated}, ...]
+        const CORRELATIONS_API_URL = 'http://localhost:8000/api/correlations';
         const POLL_INTERVAL_MS = 120000; // 2 minutes - refresh without page reload
 
         // Get references to the DOM elements
         const contentDiv = document.getElementById('content');
         const globalContentDiv = document.getElementById('global-content');
         const lastUpdatedEl = document.getElementById('last-updated');
+        const correlationContentDiv = document.getElementById('correlation-content');
 
         // True after at least one successful fetch. Used to avoid overwriting DOM with errors on poll.
         let hasLoadedOnce = false;
@@ -156,6 +185,21 @@
             const num = Number(value);
             if (isNaN(num)) return 'N/A';
             return Math.abs(num).toFixed(2) + '%';
+        }
+
+        // Formats a correlation value (float between -1 and 1) to 2 decimal places.
+        // We do not recompute correlation here; we only display what the backend stored.
+        // Rounding improves readability (e.g. 0.8473 -> "0.85").
+        // Handles null, undefined, NaN, and clamps out-of-range values for safety.
+        function formatCorrelation(value) {
+            if (value == null || value === undefined || (typeof value === 'number' && isNaN(value))) {
+                return 'N/A';
+            }
+            const num = Number(value);
+            if (isNaN(num)) return 'N/A';
+            // Clamp to [-1, 1] in case backend ever returns invalid data
+            const clamped = Math.max(-1, Math.min(1, num));
+            return clamped.toFixed(2);
         }
         
         // Function to format a large number (for volume)
@@ -227,6 +271,28 @@
             contentDiv.innerHTML = tableHTML;
         }
 
+        // Renders correlation data from /api/correlations response.
+        // Expects array of {coin_a, coin_b, correlation_30d, last_updated}.
+        // Displays as "BTC - ETH: 0.85" (uppercase for readability).
+        // Handles empty list, null/undefined, and missing fields per entry.
+        function renderCorrelations(correlations) {
+            if (!correlationContentDiv) return;
+            if (!Array.isArray(correlations) || correlations.length === 0) {
+                correlationContentDiv.className = '';
+                correlationContentDiv.textContent = 'No correlation data available';
+                return;
+            }
+            let html = '';
+            correlations.forEach(function(entry) {
+                const coinA = (entry && entry.coin_a != null) ? String(entry.coin_a).toUpperCase() : '?';
+                const coinB = (entry && entry.coin_b != null) ? String(entry.coin_b).toUpperCase() : '?';
+                const corr = formatCorrelation(entry && entry.correlation_30d);
+                html += '<div class="correlation-row">' + coinA + ' - ' + coinB + ': ' + corr + '</div>';
+            });
+            correlationContentDiv.className = '';
+            correlationContentDiv.innerHTML = html;
+        }
+
         // Updates the "last updated" line from meta.last_updated (ISO string). Keeps UI in sync with data age.
         function updateLastUpdated(isoString) {
             if (!lastUpdatedEl || !isoString) return;
@@ -240,6 +306,7 @@
 
         // Fetches /api/summary and updates the DOM. Used for initial load and by setInterval.
         // On error: log and, if we have never loaded, show error in DOM; otherwise keep last data (no flicker).
+        // Correlation fetch runs in the same refresh cycle (single refresh source) so all sections update together.
         async function refreshData() {
             try {
                 const response = await fetch(SUMMARY_API_URL);
@@ -261,6 +328,27 @@
                     contentDiv.innerHTML = 'Error: ' + error.message;
                 }
                 // Else: keep existing DOM so user keeps seeing last good data
+            }
+
+            // Fetch correlations in the same refresh cycle. Separate try/catch so correlation
+            // failures do not affect summary/coins display. UI fails safely: show error in section only.
+            try {
+                const corrResponse = await fetch(CORRELATIONS_API_URL);
+                if (corrResponse.ok) {
+                    const correlations = await corrResponse.json();
+                    renderCorrelations(correlations);
+                } else {
+                    if (correlationContentDiv) {
+                        correlationContentDiv.className = 'error';
+                        correlationContentDiv.textContent = 'Failed to load correlations';
+                    }
+                }
+            } catch (corrError) {
+                console.error('Correlation fetch failed:', corrError.message);
+                if (correlationContentDiv) {
+                    correlationContentDiv.className = 'error';
+                    correlationContentDiv.textContent = 'Error loading correlations';
+                }
             }
         }
 
